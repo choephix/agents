@@ -1,5 +1,5 @@
-# agents
+# .Agents
 
-> Quiet shared toolbox
-> agents borrow what they need
-> nothing private here
+> Prompts like pressed flowers
+> kept between markdown pages
+> blooming on demand
