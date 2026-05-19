@@ -48,12 +48,12 @@ week_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empt
 rate_str=""
 if [ -n "$five_pct" ]; then
   five_int=$(printf '%.0f' "$five_pct")
-  rate_str="${CYN}${five_int}%${RST} ${DCY}5h${RST}"
+  rate_str="${CYN}${five_int}%${RST}${DCY}/5h${RST}"
 fi
 if [ -n "$week_pct" ]; then
   week_int=$(printf '%.0f' "$week_pct")
   if [ -n "$rate_str" ]; then
-    rate_str="${rate_str} ${CYN}${week_int}%${RST} ${DCY}7d${RST}"
+    rate_str="${rate_str} ${CYN}${week_int}%${RST}${DCY}/7d${RST}"
   else
     rate_str="${CYN}${week_int}%${RST} ${DCY}7d${RST}"
   fi
