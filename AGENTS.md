@@ -1,2 +1,2 @@
-Git name: Stefan Ginev
-Git email: choephix@gmail.com
+Git name: Stefan Ginev  
+Git email: choephix@gmail.com  
