@@ -21,7 +21,7 @@ The sweet spot is a concrete question that can be answered without explanation:
 - Am I right to be suspicious of **Character X**?
 - Am I at least looking in the right direction with **Theory X**?
 
-Questions like “What happens next?”, “Who dies?”, or “What is the big twist?” don’t leave much room for the game. The fun comes from noticing clues, forming a theory, testing it with one coy word, and deciding what to ask next.
+Questions like “What happens next?”, “Who dies?”, or “What is the big twist?” don’t leave much room for the game. The fun comes from noticing clues, forming a theory, testing it with a coy word or two, and deciding what to ask next.
 
 Be specific, but take your time. You’re not trying to extract the whole truth in one question. You’re trying to surf close enough to see its shape without letting it crash over you.
 
