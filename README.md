@@ -6,4 +6,7 @@
 
 ## Skills
 
+- [Merge Main](skills/merge-main) — Bring a branch up to date while preserving main’s intent and patterns.
+- [Pith](skills/pith) — Dense, plain writing that respects the reader’s attention.
+- [PR Description](skills/pr-description) — Write concise PR descriptions from the reviewer’s seat.
 - [Spoiler Surfer](skills/spoiler-surfer) — Surf future-story spoilers one coy word at a time.
