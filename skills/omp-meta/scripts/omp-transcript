@@ -1,0 +1,562 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  omp-transcript <session.jsonl|id> [--with-tools|--hydrate] [--reasoning] [-m <n>]
+  omp-transcript result --session <session.jsonl|id> --message-id <id>
+  omp-transcript list [--cwd <dir>] [-n <count>]
+EOF
+  exit "${1:-2}"
+}
+
+fatal() {
+  printf 'omp-transcript: %s\n' "$1" >&2
+  exit 1
+}
+
+[[ ${1:-} == --help || ${1:-} == -h ]] && usage 0
+
+mode=render
+session=
+message_id=
+with_tools=false
+hydrate=false
+reasoning=false
+message_count=
+list_cwd=
+list_count=10
+sessions_root=${OMP_SESSIONS_DIR-"${HOME:-}/.omp/agent/sessions"}
+
+case ${1:-} in
+  result)
+    mode=result
+    shift
+    while (($#)); do
+      case $1 in
+        --session)
+          (($# >= 2)) || usage
+          session=$2
+          shift 2
+          ;;
+        --message-id)
+          (($# >= 2)) || usage
+          message_id=$2
+          shift 2
+          ;;
+        *) usage ;;
+      esac
+    done
+    [[ -n $session && -n $message_id ]] || usage
+    ;;
+  list)
+    mode=list
+    shift
+    while (($#)); do
+      case $1 in
+        --cwd)
+          (($# >= 2)) || usage
+          list_cwd=$2
+          shift 2
+          ;;
+        -n)
+          (($# >= 2)) || usage
+          list_count=$2
+          shift 2
+          ;;
+        *) usage ;;
+      esac
+    done
+    [[ $list_count =~ ^[1-9][0-9]{0,17}$ ]] || usage
+    ;;
+  '') usage ;;
+  *)
+    while (($#)); do
+      case $1 in
+        --with-tools)
+          with_tools=true
+          shift
+          ;;
+        --hydrate)
+          with_tools=true
+          hydrate=true
+          shift
+          ;;
+        --reasoning)
+          reasoning=true
+          shift
+          ;;
+        -m|--messages)
+          (($# >= 2)) || usage
+          [[ $2 =~ ^-?[1-9][0-9]{0,17}$ ]] || usage
+          message_count=$2
+          shift 2
+          ;;
+        -*)
+          usage
+          ;;
+        *)
+          [[ -z $session ]] || usage
+          session=$1
+          shift
+          ;;
+      esac
+    done
+    [[ -n $session ]] || usage
+    ;;
+esac
+
+command -v jq >/dev/null || fatal 'jq is required'
+
+tmpdir=
+cleanup() {
+  if [[ -n $tmpdir && -d $tmpdir ]]; then
+    rm -rf -- "$tmpdir"
+  fi
+}
+trap cleanup EXIT
+
+make_tmpdir() {
+  if [[ -z $tmpdir ]]; then
+    tmpdir=$(mktemp -d)
+  fi
+}
+
+list_sessions() {
+  local root=$sessions_root
+  local wanted_cwd=
+  local candidates sorted path metadata mtime mtime_detail entry rest header timestamp
+  local matched=0
+
+  [[ -d $root ]] || fatal "sessions root not found: $root"
+  if [[ -n $list_cwd ]]; then
+    wanted_cwd=$(realpath -- "$list_cwd" 2>/dev/null) || fatal "cwd not found: $list_cwd"
+  fi
+
+  make_tmpdir
+  candidates=$tmpdir/candidates
+  sorted=$tmpdir/candidates-sorted
+  : > "$candidates"
+
+  while IFS= read -r -d '' path; do
+    metadata=$(stat -c $'%Y\t%y' -- "$path") || continue
+    mtime=${metadata%%$'\t'*}
+    mtime_detail=${metadata#*$'\t'}
+    printf '%020d\t%s\t%s\0' "$mtime" "$mtime_detail" "$path" >> "$candidates"
+  done < <(find "$root" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' -print0)
+
+  LC_ALL=C sort -z -r -- "$candidates" > "$sorted"
+
+  while IFS= read -r -d '' entry; do
+    mtime=${entry%%$'\t'*}
+    mtime=$((10#$mtime))
+    rest=${entry#*$'\t'}
+    path=${rest#*$'\t'}
+
+    header=$(jq -cn '
+      [limit(5; inputs)] as $records
+      | first($records[] | select(type == "object" and .type == "session")) as $session
+      | if $session == null then
+          empty
+        else
+          $session + {
+            title: (
+              [$session.title, ($records[] | select(type == "object" and .type == "title") | .title)]
+              | map(select(type == "string" and length > 0))
+              | first // "-"
+            )
+          }
+        end
+    ' "$path" 2>/dev/null) || continue
+    [[ -n $header ]] || continue
+    if [[ -n $wanted_cwd ]]; then
+      [[ $(jq -r '.cwd // empty' <<<"$header") == "$wanted_cwd" ]] || continue
+    fi
+
+    timestamp=$(jq -nr --argjson epoch "$mtime" '$epoch | strftime("%Y-%m-%dT%H:%M:%SZ")')
+    jq -r \
+      --arg timestamp "$timestamp" \
+      --arg path "$path" \
+      '[ $timestamp, (.id // ""), (if .title == null then "-" else .title end), (.cwd // ""), $path ] | @tsv' \
+      <<<"$header"
+
+    ((matched += 1))
+    if ((matched >= list_count)); then break; fi
+  done < "$sorted"
+}
+
+# Accepts a path, or a session id / id prefix resolved under $sessions_root.
+resolve_session() {
+  local arg=$1 matches=() m
+
+  if [[ -f $arg ]]; then
+    return 0
+  fi
+  if [[ $arg =~ ^[0-9a-fA-F][0-9a-fA-F-]{3,}$ ]]; then
+    for m in "$sessions_root"/*/*_"$arg"*.jsonl; do
+      [[ -f $m ]] || continue
+      matches+=("$m")
+    done
+    if ((${#matches[@]} == 1)); then
+      session=${matches[0]}
+      return 0
+    elif ((${#matches[@]} == 0)); then
+      fatal "no session with id: $arg"
+    else
+      printf 'omp-transcript: ambiguous session id: %s\n' "$arg" >&2
+      printf '  %s\n' "${matches[@]}" >&2
+      exit 1
+    fi
+  fi
+  fatal "session not found: $arg"
+}
+
+if [[ $mode == list ]]; then
+  list_sessions
+  exit 0
+fi
+
+resolve_session "$session"
+session=$(realpath -- "$session")
+sidecar_dir=${session%.jsonl}
+make_tmpdir
+branch_file=$tmpdir/branch.json
+
+if ! jq -sc '
+  def ancestors($index):
+    . as $record
+    | $record,
+      (if (($record.parentId? // null) != null) and ($index[$record.parentId] != null)
+       then $index[$record.parentId] | ancestors($index)
+       else empty
+       end);
+
+  def active_branch:
+    . as $records
+    | (reduce $records[] as $record ({};
+        if (($record.id? // null) != null)
+        then .[$record.id] = $record
+        else .
+        end)) as $index
+    | ([$records[] | select((.id? // null) != null and has("parentId"))] | last) as $leaf
+    | if $leaf == null
+      then error("session contains no conversation branch")
+      else [$leaf | ancestors($index)] | reverse
+      end;
+
+  active_branch
+' "$session" > "$branch_file"; then
+  fatal 'could not read the active conversation branch'
+fi
+
+write_text_content() {
+  local record=$1 output=$2
+  jq -j '
+    def text_content($content):
+      if ($content | type) == "string" then $content
+      elif ($content | type) == "array" then
+        [$content[] | select(.type == "text") | .text] | join("\n")
+      else ""
+      end;
+    text_content(.message.content)
+  ' <<<"$record" > "$output"
+}
+
+artifact_path=
+find_artifact() {
+  local artifact=$1
+  local had_nullglob=false
+  local matches=()
+
+  shopt -q nullglob && had_nullglob=true
+  shopt -s nullglob
+  matches=("$sidecar_dir/$artifact."*)
+  $had_nullglob || shopt -u nullglob
+
+  ((${#matches[@]} > 0)) || return 1
+  [[ -f ${matches[0]} && -r ${matches[0]} ]] || return 1
+  artifact_path=${matches[0]}
+}
+
+extract_shake_region() {
+  local input=$1 region=$2 output=$3
+  jq -Rsrj --argjson wanted "$region" '
+    def blank: test("^\\s*$");
+    split("\n") as $lines
+    | ([range(0; $lines | length)
+        | select($lines[.] | test("^### region \($wanted) \\("))] | first) as $start
+    | if $start == null then error("region not found")
+      else
+        (([range($start + 1; $lines | length)
+           | select($lines[.] | test("^### region [0-9]+ \\("))] | first)
+         // ($lines | length)) as $end
+        | $lines[$start + 1:$end]
+        | if length > 0 and (.[0] | blank) then .[1:] else . end
+        | until(length == 0 or (.[-1] | blank | not); .[:-1])
+        | join("\n")
+      end
+  ' "$input" > "$output"
+}
+
+hydration_state=
+hydration_recovered=false
+hydrate_record() {
+  local record=$1 output=$2
+  local raw_artifact shaken_info shaken_artifact shaken_region resolved_path recovered_file
+
+  hydration_state=ok
+  hydration_recovered=false
+  write_text_content "$record" "$output"
+
+  raw_artifact=$(jq -Rsr '
+    [split("\n")[] | capture("^\\[raw output: artifact://(?<artifact>[0-9]+)\\]$")? | .artifact] | last // empty
+  ' "$output")
+  if [[ -n $raw_artifact ]]; then
+    if find_artifact "$raw_artifact"; then
+      cat -- "$artifact_path" > "$output"
+      hydration_recovered=true
+    fi
+    return 0
+  fi
+
+  if jq -Rse '
+      sub("\\s+$"; "")
+      | test("^\\[shaken ~[0-9]+ tokens — recover: artifact://[0-9]+ \\(region [0-9]+\\)\\]$")
+    ' "$output" >/dev/null; then
+    shaken_info=$(jq -Rsr '
+      sub("\\s+$"; "")
+      | capture("^\\[shaken ~[0-9]+ tokens — recover: artifact://(?<artifact>[0-9]+) \\(region (?<region>[0-9]+)\\)\\]$")
+      | "\(.artifact)\t\(.region)"
+    ' "$output")
+    shaken_artifact=${shaken_info%%$'\t'*}
+    shaken_region=${shaken_info#*$'\t'}
+    if find_artifact "$shaken_artifact"; then
+      recovered_file=$tmpdir/recovered
+      if extract_shake_region "$artifact_path" "$shaken_region" "$recovered_file" 2>/dev/null; then
+        mv -- "$recovered_file" "$output"
+        hydration_recovered=true
+        return 0
+      fi
+    fi
+  elif ! jq -Rse '
+      sub("\\s+$"; "")
+      | test("^\\[Output truncated - [0-9]+ tokens\\]$")
+    ' "$output" >/dev/null; then
+    return 0
+  fi
+
+  if jq -e '(.message.details.displayContent.text | type) == "string"' >/dev/null <<<"$record"; then
+    jq -j '.message.details.displayContent.text' <<<"$record" > "$output"
+    hydration_recovered=true
+    return 0
+  fi
+  if jq -e '(.message.details.truncation.content | type) == "string"' >/dev/null <<<"$record"; then
+    jq -j '.message.details.truncation.content' <<<"$record" > "$output"
+    hydration_recovered=true
+    return 0
+  fi
+  if jq -e '(.message.details.resolvedPath | type) == "string"' >/dev/null <<<"$record"; then
+    resolved_path=$(jq -r '.message.details.resolvedPath' <<<"$record")
+    if [[ -f $resolved_path && -r $resolved_path ]]; then
+      cat -- "$resolved_path" > "$output"
+      hydration_recovered=true
+      return 0
+    fi
+  fi
+
+  hydration_state=unrecoverable
+}
+
+
+if [[ $mode == result ]]; then
+  record=$(jq -c --arg id "$message_id" '[.[] | select(.id == $id)] | first' "$branch_file")
+  [[ $record != null ]] || fatal 'message is not on the active branch'
+  [[ $(jq -r '.type == "message" and .message.role == "toolResult"' <<<"$record") == true ]] || fatal 'message is not a tool result'
+
+  result_body=$tmpdir/result-body
+  hydrate_record "$record" "$result_body"
+  cat -- "$result_body"
+  if [[ $hydration_state == unrecoverable ]]; then
+    printf 'omp-transcript: full output not recorded in session\n' >&2
+    exit 3
+  fi
+  exit 0
+fi
+
+slice_count=${message_count:-null}
+render_plan=$tmpdir/render-plan.json
+
+jq -c \
+  --arg session "$session" \
+  --argjson count "$slice_count" \
+  --argjson with_tools "$with_tools" \
+  --argjson reasoning "$reasoning" '
+  def text_content($record):
+    $record.message.content as $content
+    | if ($content | type) == "string" then $content
+      elif ($content | type) == "array" then
+        [$content[] | select(.type == "text") | (.text // "")] | join("\n")
+      else ""
+      end;
+
+  def fence($body):
+    ((([$body | scan("`+") | length] | max) // 0) + 1) as $length
+    | "`" * (if $length < 3 then 3 else $length end);
+
+  def tagged_section($tag; $attributes; $body):
+    "<\($tag)\($attributes)>\n\($body)\n</\($tag)>\n\n";
+
+  def fenced_section($tag; $attributes; $body; $info):
+    fence($body) as $fence
+    | "<\($tag)\($attributes)>\n\($fence)\($info)\n\($body)\n\($fence)\n</\($tag)>\n\n";
+
+  def render_sections($record):
+    if $record.type == "message" then
+      if (["user", "developer"] | index($record.message.role)) != null then
+        text_content($record) as $body
+        | if $body == "" then []
+          else [tagged_section($record.message.role; ""; $body)]
+          end
+      elif $record.message.role == "bashExecution" then
+        ($record.message.output // "") as $body
+        | (" command=\"\($record.message.command)\""
+           + (if $record.message | has("exitCode") then " exit=\"\($record.message.exitCode)\"" else "" end)
+           + (if $record.message.cancelled == true then " cancelled=\"true\"" else "" end)
+           + (if $record.message.truncated == true then " truncated=\"true\"" else "" end)) as $attributes
+        | [fenced_section("bash-execution"; $attributes; $body; "")]
+      elif $record.message.role == "fileMention" then
+        [$record.message.files[]? as $file
+          | ($file.path // "") as $path
+          | if ($file.image | type) == "object" then
+              "<file-mention path=\"\($path)\" image=\"\($file.image.mimeType)\" />\n\n"
+            else
+              ($file.content | if type == "string" then . else "" end) as $body
+              | (" path=\"\($path)\""
+                 + (if $file | has("lineCount") then " lines=\"\($file.lineCount)\"" else "" end)
+                 + (if $body != "" then " bytes=\"\($body | utf8bytelength)\"" else "" end)) as $attributes
+              | if $with_tools then
+                  fenced_section("file-mention"; $attributes; $body; "")
+                else
+                  "<file-mention\($attributes) />\n\n"
+                end
+            end]
+      elif $record.message.role == "assistant" then
+        [$record.message.content[]?
+          | if $reasoning and .type == "thinking" and (.thinking | type) == "string" and .thinking != "" then
+              tagged_section("reasoning"; ""; .thinking)
+            elif .type == "text" and (.text | type) == "string" and .text != "" then
+              tagged_section("assistant"; ""; .text)
+            elif .type == "toolCall" and $with_tools then
+              ((.arguments // .input // {}) | tojson) as $body
+              | fenced_section("tool-call"; " name=\"\(.name // "unknown")\""; $body; "json")
+            else empty
+            end]
+      elif $record.message.role == "toolResult" and $with_tools then
+        text_content($record) as $body
+        | ($record.message.toolName // "unknown") as $tool
+        | (if $record.message.isError then "error" else "successful" end) as $status
+        | ("omp-transcript result --session \(($session | @sh)) --message-id \(($record.id // "" | tostring | @sh))") as $command
+        | [fenced_section(
+            "tool-result";
+            " tool=\"\($tool)\" status=\"\($status)\" bytes=\"\($body | utf8bytelength)\"";
+            $command;
+            "bash"
+          )]
+      else []
+      end
+    elif $record.type == "custom_message"
+         and ($record.content | type) == "string"
+         and $record.content != ""
+         and ($record.customType | type) == "string" then
+      [tagged_section("custom-message"; " type=\"\($record.customType)\""; $record.content)]
+    elif $record.type == "compaction"
+         and ($record.summary | type) == "string"
+         and $record.summary != "" then
+      [tagged_section("compaction-summary"; ""; $record.summary)]
+    elif $record.type == "branch_summary"
+         and ($record.summary | type) == "string"
+         and $record.summary != "" then
+      [tagged_section("branch-summary"; ""; $record.summary)]
+    else []
+    end;
+
+  [.[] as $record
+    | {record: $record, sections: render_sections($record)}
+    | select(.sections | length > 0)] as $messages
+  | {
+      total: ($messages | length),
+      messages: (
+        $messages
+        | if $count == null then .
+          elif $count < 0 then .[$count:]
+          else .[:$count]
+          end
+      )
+    }
+' "$branch_file" > "$render_plan"
+
+body_file=$tmpdir/body
+if $hydrate; then
+  hydrated_items=$tmpdir/hydrated-items.jsonl
+  : > "$hydrated_items"
+  while IFS= read -r item; do
+    record=$(jq -c '.record' <<<"$item")
+    if jq -e '.type == "message" and .message.role == "toolResult"' >/dev/null <<<"$record"; then
+      hydrate_record "$record" "$body_file"
+      jq -c \
+        --rawfile body "$body_file" \
+        --arg state "$hydration_state" \
+        '.record += {_omp_hydrated_body: $body, _omp_hydration_state: $state}' \
+        <<<"$item" >> "$hydrated_items"
+    else
+      printf '%s\n' "$item" >> "$hydrated_items"
+    fi
+  done < <(jq -c '.messages[]' "$render_plan")
+
+  hydrated_plan=$tmpdir/hydrated-plan.json
+  jq -c --slurpfile messages "$hydrated_items" '.messages = $messages' \
+    "$render_plan" > "$hydrated_plan"
+  render_plan=$hydrated_plan
+fi
+
+jq -rj \
+  --arg session "$session" \
+  --argjson count "$slice_count" \
+  --argjson hydrate "$hydrate" '
+  def fence($body):
+    ((([$body | scan("`+") | length] | max) // 0) + 1) as $length
+    | "`" * (if $length < 3 then 3 else $length end);
+
+  def hydrated_tool_section($record):
+    $record._omp_hydrated_body as $body
+    | ($record.message.toolName // "unknown") as $tool
+    | (if $record.message.isError then "error" else "successful" end) as $status
+    | fence($body) as $fence
+    | if $record._omp_hydration_state == "unrecoverable" then
+        "<tool-result tool=\"\($tool)\" status=\"\($status)\" recovered=\"false\">\n\($fence)\n\($body)\n\($fence)\n</tool-result>\n\n"
+      else
+        "<tool-result tool=\"\($tool)\" status=\"\($status)\" bytes=\"\($body | utf8bytelength)\">\n\($fence)\n\($body)\n\($fence)\n</tool-result>\n\n"
+      end;
+
+  if $hydrate then
+    .messages |= map(
+      if .record.type == "message" and .record.message.role == "toolResult" then
+        .sections = [hydrated_tool_section(.record)]
+      else .
+      end)
+  else .
+  end
+  | (if $count == null then ""
+     else
+       ($count | if . < 0 then . * -1 else . end) as $wanted
+       | ([$wanted, .total] | min) as $shown
+       | "- **Messages:** \(if $count < 0 then "last" else "first" end) \($shown) of \(.total)\n"
+     end) as $messages_header
+  | "# OMP transcript\n\n"
+    + "- **Source:** `\($session)`\n"
+    + "- **Branch:** active branch only\n"
+    + $messages_header
+    + "\n"
+    + ([.messages[].sections[]] | join(""))
+' "$render_plan"
