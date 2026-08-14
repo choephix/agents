@@ -1,10 +1,10 @@
 {
-	"name": "@my-agents/shadow",
+	"name": "@my-agents/shadow-agent",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
 	"bin": {
-		"shadow": "./shadow.ts"
+		"shadow-agent": "./shadow-agent.ts"
 	},
 	"dependencies": {
 		"@oh-my-pi/pi-coding-agent": "17.2.12"

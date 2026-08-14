@@ -135,7 +135,7 @@ export async function createShadow(def: ShadowDef, cwd: string, options: ShadowO
 		try {
 			await session.prompt(renderWakeup(batch));
 		} catch (error) {
-			process.stderr.write(`\nshadow: prompt failed: ${error instanceof Error ? error.message : String(error)}\n`);
+			process.stderr.write(`\nshadow-agent: prompt failed: ${error instanceof Error ? error.message : String(error)}\n`);
 		} finally {
 			busy = false;
 		}
@@ -150,7 +150,7 @@ export async function createShadow(def: ShadowDef, cwd: string, options: ShadowO
 		try {
 			matched = def.filter ? def.filter(turn) === true : true;
 		} catch (error) {
-			process.stderr.write(`shadow: filter threw, skipping turn: ${error instanceof Error ? error.message : String(error)}\n`);
+			process.stderr.write(`shadow-agent: filter threw, skipping turn: ${error instanceof Error ? error.message : String(error)}\n`);
 			return;
 		}
 		if (!matched) return;

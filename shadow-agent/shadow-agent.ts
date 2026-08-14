@@ -7,7 +7,7 @@ import { createShadow } from "./src/driver";
 import { sourceLabel } from "./src/turns";
 import { watchSessionTree } from "./src/watch";
 
-const USAGE = `usage: shadow [--session <idOrPrefix>] [--replay] <def.ts>
+const USAGE = `usage: shadow-agent [--session <idOrPrefix>] [--replay] <def.ts>
 
   --session <ref>  attach to a session whose filename contains <ref>
                    (default: most recently modified session for this cwd)
@@ -34,7 +34,7 @@ function parseArgs(argv: string[]): CliArgs {
 			process.stdout.write(USAGE);
 			process.exit(0);
 		} else if (arg.startsWith("-")) {
-			process.stderr.write(`shadow: unknown flag ${arg}\n\n${USAGE}`);
+			process.stderr.write(`shadow-agent: unknown flag ${arg}\n\n${USAGE}`);
 			process.exit(2);
 		} else defPath = arg;
 	}
@@ -101,7 +101,7 @@ const budgetLabel = budgetParts.length > 0 ? budgetParts.join(" / ") : "unbounde
 
 process.stdout.write(
 	[
-		`shadow: ${path.basename(defPath)}`,
+		`shadow-agent: ${path.basename(defPath)}`,
 		`  observing  ${target}${replay ? " (replaying existing records)" : ""}`,
 		`  sources    ${sources.join(", ")} — ${watch.attached()} transcript(s) attached`,
 		`  model      ${shadow.model}`,
@@ -120,7 +120,7 @@ let closing = false;
 async function shutdown(code = 0): Promise<void> {
 	if (closing) return;
 	closing = true;
-	process.stdout.write(dim("\nshadow: stopping\n"));
+	process.stdout.write(dim("\nshadow-agent: stopping\n"));
 	watch.stop();
 	await shadow.dispose();
 	process.exit(code);
