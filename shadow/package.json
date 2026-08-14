@@ -1,0 +1,15 @@
+{
+	"name": "@my-agents/shadow",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"bin": {
+		"shadow": "./shadow.ts"
+	},
+	"dependencies": {
+		"@oh-my-pi/pi-coding-agent": "17.2.12"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.3.14"
+	}
+}
