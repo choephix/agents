@@ -106,4 +106,14 @@ export type ShadowDef = {
 	 * the timer. Guards against acting on a half-finished burst of work. Default 0.
 	 */
 	debounceMs?: number;
+	/**
+	 * Stop after this many tokens have been spent in total. Unbounded when omitted.
+	 *
+	 * Checked before each wakeup, never mid-turn, so the final wakeup can overshoot
+	 * by one turn. A shadow that watches subagents can wake hundreds of times on a
+	 * fan-out session, which is what this is for.
+	 */
+	maxTokens?: number;
+	/** Stop after this much has been spent in USD. Unbounded when omitted. */
+	maxCostUsd?: number;
 };

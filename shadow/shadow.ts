@@ -72,7 +72,9 @@ const { sessionRef, replay, defPath } = parseArgs(process.argv.slice(2));
 const cwd = process.cwd();
 const target = resolveTarget(cwd, sessionRef);
 const def = await loadDef(defPath);
-const shadow = await createShadow(def, cwd);
+// Exiting non-zero distinguishes "stopped early, budget spent" from a clean stop,
+// so a supervisor does not read exhaustion as completion.
+const shadow = await createShadow(def, cwd, { onExhausted: () => void shutdown(1) });
 const sources = def.sources ?? ["main"];
 const dim = (text: string): string => `\x1b[2m${text}\x1b[0m`;
 
@@ -91,6 +93,12 @@ const watch = watchSessionTree({
 	},
 });
 
+const budgetParts = [
+	def.maxTokens !== undefined ? `${def.maxTokens} tokens` : "",
+	def.maxCostUsd !== undefined ? `$${def.maxCostUsd}` : "",
+].filter(Boolean);
+const budgetLabel = budgetParts.length > 0 ? budgetParts.join(" / ") : "unbounded";
+
 process.stdout.write(
 	[
 		`shadow: ${path.basename(defPath)}`,
@@ -99,6 +107,7 @@ process.stdout.write(
 		`  model      ${shadow.model}`,
 		`  tools      ${(def.tools ?? ["read", "grep", "glob", "bash"]).join(", ")}`,
 		`  filter     ${def.filter ? "custom" : "match everything observed"}${def.debounceMs ? `, debounce ${def.debounceMs}ms` : ""}`,
+		`  budget     ${budgetLabel}`,
 		`  session    ${shadow.sessionFile ?? "(pending)"}`,
 		dim(`             inspect: omp --session-dir=${path.dirname(shadow.sessionFile ?? "")} --session=${path.basename(shadow.sessionFile ?? "", ".jsonl")}`),
 		dim("  waiting for matching work — Ctrl+C to stop"),
@@ -108,13 +117,13 @@ process.stdout.write(
 banneredStartup = true;
 
 let closing = false;
-async function shutdown(): Promise<void> {
+async function shutdown(code = 0): Promise<void> {
 	if (closing) return;
 	closing = true;
 	process.stdout.write(dim("\nshadow: stopping\n"));
 	watch.stop();
 	await shadow.dispose();
-	process.exit(0);
+	process.exit(code);
 }
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

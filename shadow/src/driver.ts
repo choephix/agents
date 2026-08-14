@@ -31,7 +31,7 @@ function buildShadowPrompt(instruction: string): string {
 }
 
 export type Shadow = {
-	/** Offer a finished main-session turn; ignored unless the filter matches. */
+	/** Offer a finished record; ignored unless the filter matches. */
 	enqueue: (turn: TurnRecord) => void;
 	dispose: () => Promise<void>;
 	/** Resolved model id, for the startup banner. */
@@ -40,7 +40,15 @@ export type Shadow = {
 	sessionFile: string | undefined;
 };
 
-export async function createShadow(def: ShadowDef, cwd: string): Promise<Shadow> {
+export type ShadowOptions = {
+	/**
+	 * The budget ran out: this shadow will not wake again. Called once, after the
+	 * turn that crossed the ceiling has finished.
+	 */
+	onExhausted?: () => void;
+};
+
+export async function createShadow(def: ShadowDef, cwd: string, options: ShadowOptions = {}): Promise<Shadow> {
 	const sessionFile = newShadowSessionFile(cwd);
 	mkdirSync(path.dirname(sessionFile), { recursive: true });
 	// `open` on a not-yet-existing path creates the session there. Explicit dir keeps
@@ -62,6 +70,12 @@ export async function createShadow(def: ShadowDef, cwd: string): Promise<Shadow>
 	});
 	if (modelFallbackMessage) process.stderr.write(`${dim(`model fallback: ${modelFallbackMessage}`)}\n`);
 
+	// Accumulate as turns finish rather than summing `session.messages`: compaction
+	// drops entries, so a running total taken from the message list silently shrinks
+	// and a ceiling taken from it would never trip.
+	let tokensSpent = 0;
+	let costSpent = 0;
+
 	session.subscribe(event => {
 		if (event.type === "message_update") {
 			if (event.assistantMessageEvent.type === "text_delta") {
@@ -74,18 +88,49 @@ export async function createShadow(def: ShadowDef, cwd: string): Promise<Shadow>
 			const detail = typeof args?.command === "string" ? args.command : typeof args?.path === "string" ? args.path : "";
 			const suffix = detail ? ` ${detail.replace(/\s+/g, " ").slice(0, 100)}` : "";
 			process.stdout.write(dim(`\n  · ${event.toolName}${suffix}\n`));
+			return;
+		}
+		if (event.type === "turn_end" && event.message.role === "assistant") {
+			const usage = event.message.usage;
+			if (!usage) return;
+			tokensSpent += usage.totalTokens ?? 0;
+			costSpent += usage.cost?.total ?? 0;
 		}
 	});
+
+	function overBudget(): boolean {
+		return (
+			(def.maxTokens !== undefined && tokensSpent >= def.maxTokens) ||
+			(def.maxCostUsd !== undefined && costSpent >= def.maxCostUsd)
+		);
+	}
+
+	function spentLabel(): string {
+		const tokens = `${(tokensSpent / 1000).toFixed(1)}k tok`;
+		const cost = costSpent > 0 ? `, $${costSpent.toFixed(4)}` : "";
+		return `${tokens}${cost}`;
+	}
 
 	const queue: TurnRecord[] = [];
 	let busy = false;
 	let timer: Timer | undefined;
 
+	let exhausted = false;
+
 	async function flush(): Promise<void> {
-		if (busy || queue.length === 0) return;
+		if (busy || exhausted || queue.length === 0) return;
+		// Checked between wakeups, never mid-turn: the crossing turn runs to completion
+		// rather than being cut off halfway through its work.
+		if (overBudget()) {
+			exhausted = true;
+			queue.length = 0;
+			process.stdout.write(`\n${bold("▪ budget spent")} ${dim(`${spentLabel()} — not waking again`)}\n`);
+			options.onExhausted?.();
+			return;
+		}
 		busy = true;
 		const batch = queue.splice(0);
-		const label = `${batch.length} turn${batch.length === 1 ? "" : "s"}`;
+		const label = `${batch.length} event${batch.length === 1 ? "" : "s"}`;
 		process.stdout.write(`\n${bold(`▸ waking on ${label}`)} ${dim(new Date().toLocaleTimeString())}\n`);
 		try {
 			await session.prompt(renderWakeup(batch));
@@ -94,12 +139,13 @@ export async function createShadow(def: ShadowDef, cwd: string): Promise<Shadow>
 		} finally {
 			busy = false;
 		}
-		process.stdout.write(`\n${dim("— idle —")}\n`);
-		// Turns that matched while we were prompting batch into the next wakeup.
+		process.stdout.write(`\n${dim(`— idle — ${spentLabel()}`)}\n`);
+		// Records that matched while we were prompting batch into the next wakeup.
 		await flush();
 	}
 
 	function enqueue(turn: TurnRecord): void {
+		if (exhausted) return;
 		let matched: boolean;
 		try {
 			matched = def.filter ? def.filter(turn) === true : true;
