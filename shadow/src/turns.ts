@@ -26,6 +26,8 @@ type SessionEntry = {
 	/** `custom_message` payload: injected context rendered into the conversation. */
 	content?: unknown;
 	customType?: string;
+	/** `custom` record payload, e.g. `session_exit`. */
+	data?: unknown;
 };
 
 /**
@@ -60,6 +62,24 @@ function asText(value: unknown): string {
 	return JSON.stringify(value);
 }
 
+/** What a transcript's `session_exit` record says. */
+export type ExitFact = {
+	kind?: string;
+	reason?: string;
+	pendingToolCalls?: string[];
+	timestamp: string;
+};
+
+export type AssemblerHandlers = {
+	onTurn: (turn: TurnRecord) => void;
+	/**
+	 * The transcript recorded `session_exit`: its session tore down. Reported as a
+	 * fact rather than a record, because whether it means "finished and delivered"
+	 * or "gone with nothing" depends on the output artifact, which the watcher owns.
+	 */
+	onExit?: (fact: ExitFact) => void;
+};
+
 /**
  * Fold one transcript's entries into finished records.
  *
@@ -71,7 +91,8 @@ function asText(value: unknown): string {
  * record to post-steer work. Turns triggered by injected context rather than a
  * user message take their opener from the `custom_message` entry.
  */
-export function createTurnAssembler(source: TurnSource, onTurn: (turn: TurnRecord) => void): (entry: unknown) => void {
+export function createTurnAssembler(source: TurnSource, handlers: AssemblerHandlers): (entry: unknown) => void {
+	const onTurn = handlers.onTurn;
 	let userText = "";
 	let assistantText = "";
 	let toolCalls: ShadowToolCall[] = [];
@@ -95,6 +116,23 @@ export function createTurnAssembler(source: TurnSource, onTurn: (turn: TurnRecor
 	return (raw: unknown) => {
 		const entry = raw as SessionEntry | null;
 		if (!entry) return;
+
+		if (entry.type === "custom" && entry.customType === "session_exit") {
+			const data = (entry.data ?? {}) as {
+				kind?: unknown;
+				reason?: unknown;
+				pendingToolCalls?: { toolName?: unknown }[];
+			};
+			handlers.onExit?.({
+				kind: typeof data.kind === "string" ? data.kind : undefined,
+				reason: typeof data.reason === "string" ? data.reason : undefined,
+				pendingToolCalls: data.pendingToolCalls
+					?.map(call => (typeof call?.toolName === "string" ? call.toolName : ""))
+					.filter(name => name.length > 0),
+				timestamp: entry.timestamp ?? new Date().toISOString(),
+			});
+			return;
+		}
 
 		if (entry.type === "custom_message") {
 			// An injected message can open a turn (`triggerTurn`) or land mid-turn
@@ -181,7 +219,24 @@ const EVENT_HEADLINES: Record<string, string> = {
 	yield: "handed back a result (yield)",
 };
 
+const GONE_HEADLINES: Record<string, string> = {
+	killed: "was killed without producing a result",
+	exited: "exited without producing a result",
+	abandoned: "never produced a result before the observed session ended",
+};
+
 function headline(turn: TurnRecord): string {
+	if (turn.event === "gone" && turn.gone) {
+		const detail = turn.gone.exitKind ? ` [${turn.gone.exitKind}/${turn.gone.exitReason ?? "?"}]` : "";
+		// A stuck agent can leave dozens of pending calls; distinct names carry the
+		// diagnostic value, the repetition does not.
+		const names = [...new Set(turn.gone.pendingToolCalls ?? [])];
+		const shown = names.slice(0, 5).join(", ");
+		const rest = names.length > 5 ? ` +${names.length - 5} more` : "";
+		const count = turn.gone.pendingToolCalls?.length ?? 0;
+		const pending = count > 0 ? ` mid-flight: ${shown}${rest} (${count} call${count === 1 ? "" : "s"})` : "";
+		return `${sourceLabel(turn.source)} ${GONE_HEADLINES[turn.gone.reason]}${detail}${pending} — ${turn.timestamp}`;
+	}
 	const what = EVENT_HEADLINES[turn.event] ?? `settled (${turn.stopReason ?? "unknown"})`;
 	return `${sourceLabel(turn.source)} ${what} — ${turn.timestamp}`;
 }

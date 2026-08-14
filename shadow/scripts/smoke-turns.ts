@@ -7,10 +7,11 @@
  * With a shadow def, also reports which records its filter would have woken,
  * so a filter can be dry-run against real history before spending anything.
  */
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { loadDef } from "../src/def";
 import { scanArtifactTree } from "../src/sources";
 import { createTurnAssembler, renderWakeup, sourceLabel } from "../src/turns";
+import type { ExitFact } from "../src/turns";
 import type { ObservedSource } from "../src/sources";
 import type { TurnRecord } from "../src/types";
 
@@ -33,8 +34,18 @@ const observed: ObservedSource[] = [
 	...(sources.includes("subagent") ? scan.transcripts : []),
 ];
 
+// The observed session's own exit makes outstanding agents decidably gone.
+let sessionExited = false;
+const exits = new Map<string, ExitFact>();
+
 for (const { file: transcript, source } of observed) {
-	const assemble = createTurnAssembler(source, turn => records.push(turn));
+	const assemble = createTurnAssembler(source, {
+		onTurn: turn => records.push(turn),
+		onExit: fact => {
+			if (source.kind === "main") sessionExited = true;
+			else exits.set(transcript, fact);
+		},
+	});
 	let text: string;
 	try {
 		text = await Bun.file(transcript).text();
@@ -52,22 +63,38 @@ for (const { file: transcript, source } of observed) {
 	}
 }
 
-// Mirror the watcher: each output artifact is one `done` record, so a filter on
-// completions dry-runs exactly as it will behave live.
-for (const { file: output, source } of sources.includes("subagent") ? scan.outputs : []) {
-	try {
-		records.push({
-			source,
-			event: "done",
-			timestamp: statSync(output).mtime.toISOString(),
-			userText: "",
-			assistantText: "",
-			toolCalls: [],
-			result: await Bun.file(output).text(),
-		});
-	} catch {
+// Mirror the watcher's arbitration exactly, so wake counts are faithful: an
+// output artifact is `done`; its absence plus a terminal fact is `gone`.
+for (const { file: transcript, source } of sources.includes("subagent") ? scan.transcripts : []) {
+	const output = transcript.replace(/\.jsonl$/, ".md");
+	if (existsSync(output)) {
+		try {
+			records.push({
+				source,
+				event: "done",
+				timestamp: statSync(output).mtime.toISOString(),
+				userText: "",
+				assistantText: "",
+				toolCalls: [],
+				result: await Bun.file(output).text(),
+			});
+		} catch {
+			// Unreadable artifact: nothing to report.
+		}
 		continue;
 	}
+	const exit = exits.get(transcript);
+	const reason = existsSync(`${transcript}.tombstone`) ? "killed" : exit ? "exited" : sessionExited ? "abandoned" : undefined;
+	if (!reason) continue;
+	records.push({
+		source,
+		event: "gone",
+		timestamp: exit?.timestamp ?? new Date().toISOString(),
+		userText: "",
+		assistantText: "",
+		toolCalls: [],
+		gone: { reason, exitKind: exit?.kind, exitReason: exit?.reason, pendingToolCalls: exit?.pendingToolCalls },
+	});
 }
 
 records.sort((left, right) => left.timestamp.localeCompare(right.timestamp));
@@ -94,7 +121,8 @@ for (const turn of records.slice(0, 40)) {
 	process.stdout.write(`${mark} ${turn.timestamp} ${turn.event.padEnd(5)} ${sourceLabel(turn.source)}${tools}\n`);
 }
 
-const lastYield = records.filter(turn => turn.event === "yield").at(-1);
-if (lastYield) {
-	process.stdout.write(`\n--- renderWakeup([last yield]) ---\n${renderWakeup([lastYield])}\n`);
+// Preview what the shadow would actually be handed: the last matching record.
+const preview = [...matches].at(-1) ?? records.at(-1);
+if (preview) {
+	process.stdout.write(`\n--- renderWakeup([last match]) ---\n${renderWakeup([preview])}\n`);
 }

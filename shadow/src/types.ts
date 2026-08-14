@@ -32,8 +32,33 @@ export type TurnSource = {
  * - `done` — the agent's final-output artifact appeared. This is the reliable
  *   "finished work" signal for every subagent, including those that never yield.
  *   Fires once per agent.
+ * - `gone` — the agent is finished and delivered nothing. Fires at most once per
+ *   agent, and never after `done`. See {@link GoneReason}.
  */
-export type TurnEvent = "turn" | "yield" | "done";
+export type TurnEvent = "turn" | "yield" | "done" | "gone";
+
+/**
+ * Why an agent produced no result. Every reason is a definitive observation, not
+ * a timeout: an agent that is merely slow is never reported gone.
+ *
+ * - `killed` — a `.tombstone` sidecar was written beside its transcript, which
+ *   the harness does on an explicit kill.
+ * - `exited` — its own session recorded `session_exit` and no output exists.
+ * - `abandoned` — the observed session itself recorded `session_exit`, so no
+ *   further delivery is possible and this agent never produced one.
+ */
+export type GoneReason = "killed" | "exited" | "abandoned";
+
+/** Terminal detail for a `gone` record. */
+export type GoneDetail = {
+	reason: GoneReason;
+	/** `session_exit` kind: `normal`, `signal`, `fatal`, or `process_exit`. */
+	exitKind?: string;
+	/** `session_exit` reason, e.g. `dispose`, `sigterm`, `uncaught_exception`. */
+	exitReason?: string;
+	/** Tools left mid-flight when the session recorded its exit. */
+	pendingToolCalls?: string[];
+};
 
 /** One finished unit of observed work. This is what a filter sees. */
 export type TurnRecord = {
@@ -54,6 +79,8 @@ export type TurnRecord = {
 	toolCalls: ShadowToolCall[];
 	/** The `yield` argument, or the final output for a `done` record. */
 	result?: string;
+	/** Terminal detail, when `event === "gone"`. */
+	gone?: GoneDetail;
 };
 
 /** A shadow definition: the default export of a shadow file. */
