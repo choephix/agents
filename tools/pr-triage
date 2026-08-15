@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# pr-triage — score and rank your open PRs by yield-vs-effort.
+#
+# Run from any GitHub repo checkout. Infers owner/repo from the cwd's origin
+# remote. Fetches PR metadata via `gh` GraphQL, scores each PR with tunable
+# heuristics, and prints a ranked markdown report grouped by action bucket.
+#
+# Usage:
+#   pr-triage              ranked report for the current repo
+#   pr-triage --json       raw scored JSON (pipe to jq, feed to LLM, etc.)
+#   pr-triage --llm        append an LLM judgment pass on ambiguous PRs
+#   pr-triage --author X   override author (default: `gh` authenticated user)
+#   pr-triage --repo o/r   override repo (default: cwd origin)
+#   pr-triage --help
+#
+# Requires: gh (authenticated), jq, bash ≥4.
+
+set -euo pipefail
+
+# ── args ─────────────────────────────────────────────────────────────────────
+
+AUTHOR=""
+REPO=""
+OUTPUT="markdown"
+LLM=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)    OUTPUT="json";  shift ;;
+    --llm)     LLM=true;      shift ;;
+    --author)  AUTHOR="$2";   shift 2 ;;
+    --repo)    REPO="$2";     shift 2 ;;
+    --help|-h)
+      sed -n '2,/^$/{ s/^# //; s/^#$//; p }' "$0"
+      exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+# ── repo detection ───────────────────────────────────────────────────────────
+
+if [[ -z "$REPO" ]]; then
+  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
+    echo "error: not in a GitHub repo (or gh not authenticated)" >&2
+    exit 1
+  }
+fi
+
+if [[ -z "$AUTHOR" ]]; then
+  AUTHOR=$(gh api graphql -f query='{ viewer { login } }' -q .data.viewer.login 2>/dev/null) || {
+    echo "error: cannot determine GitHub username" >&2
+    exit 1
+  }
+fi
+
+NOW=$(date -u +%s)
+
+# ── fetch ────────────────────────────────────────────────────────────────────
+
+QUERY='
+query($q: String!, $cursor: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        isDraft
+        createdAt
+        updatedAt
+        baseRefName
+        headRefName
+        mergeable
+        mergeStateStatus
+        additions
+        deletions
+        changedFiles
+        reviewDecision
+        labels(first: 20) { nodes { name } }
+        statusCheckRollup: commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+'
+
+SEARCH_Q="repo:${REPO} is:pr is:open author:${AUTHOR}"
+
+ALL_PRS=$(gh api graphql -f query="$QUERY" -f q="$SEARCH_Q" --paginate 2>/dev/null \
+  | jq -s '[ .[].data.search.nodes[] ]') || {
+  echo "error: GraphQL query failed" >&2; exit 1
+}
+
+COUNT=$(echo "$ALL_PRS" | jq length)
+if [[ "$COUNT" -eq 0 ]]; then
+  echo "No open PRs found for $AUTHOR in $REPO."
+  exit 0
+fi
+
+# ── score ────────────────────────────────────────────────────────────────────
+
+SCORED=$(echo "$ALL_PRS" | jq --argjson now "$NOW" '
+  def age_days: ((($now - (. | sub("(\\.[0-9]+)?Z$";"") | strptime("%Y-%m-%dT%H:%M:%S") | mktime)) / 86400) | floor);
+  def ci_state: .statusCheckRollup.nodes[0].commit.statusCheckRollup.state // "UNKNOWN";
+
+  [ .[] | {
+    number,
+    title,
+    url,
+    draft: .isDraft,
+    created: .createdAt,
+    updated: .updatedAt,
+    base: .baseRefName,
+    head: .headRefName,
+    merge_state: .mergeStateStatus,
+    ci: ci_state,
+    review: (.reviewDecision // "NONE"),
+    additions,
+    deletions,
+    changed_files: .changedFiles,
+    labels: [.labels.nodes[].name],
+    age_days: (.createdAt | age_days),
+    inactive_days: (.updatedAt | age_days),
+    size: (.additions + .deletions),
+  } | . + {
+    # ── scoring ──
+    score: (
+      0
+      # age pressure
+      + (if .age_days > 90 then -5
+         elif .age_days > 30 then -3
+         elif .age_days < 14 then 2
+         else 0 end)
+      # inactivity
+      + (if .inactive_days > 30 then -3
+         elif .inactive_days > 14 then -2
+         else 0 end)
+      # draft penalty
+      + (if .draft then -2 else 0 end)
+      # merge state
+      + (if .merge_state == "DIRTY" then -3
+         elif .merge_state == "BEHIND" then -1
+         elif .merge_state == "CLEAN" then 2
+         else 0 end)
+      # CI
+      + (if .ci == "SUCCESS" then 2
+         elif .ci == "FAILURE" then -1
+         elif .ci == "ERROR" then -1
+         else 0 end)
+      # review
+      + (if .review == "APPROVED" then 3
+         elif .review == "CHANGES_REQUESTED" then -1
+         else 0 end)
+      # size bonus for small PRs (easy to close)
+      + (if .size < 50 then 1
+         elif .size > 500 then -1
+         else 0 end)
+    )
+  } | . + {
+    # ── bucketing (rules beat raw score) ──
+    bucket: (
+      if (.draft | not) and .ci == "SUCCESS" and .merge_state == "CLEAN"
+         and (.review == "APPROVED" or .review == "NONE")
+      then "easy_merge"
+      elif .age_days > 30 and (.draft or .merge_state == "DIRTY")
+           and .inactive_days > 14 and .review != "APPROVED"
+      then "easy_close"
+      elif .age_days < 30 and (.ci == "FAILURE" or .merge_state == "DIRTY")
+      then "needs_attention"
+      elif .age_days > 30 and .ci == "SUCCESS" and .merge_state == "CLEAN"
+      then "decision_needed"
+      elif .age_days > 30
+      then "decision_needed"
+      else "monitor"
+      end
+    )
+  } ] | sort_by(-.score)
+')
+
+# ── output ───────────────────────────────────────────────────────────────────
+
+if [[ "$OUTPUT" == "json" ]]; then
+  echo "$SCORED"
+  exit 0
+fi
+
+# ── markdown report ──────────────────────────────────────────────────────────
+
+print_section() {
+  local bucket="$1" heading="$2" emoji="$3"
+  local items
+  items=$(echo "$SCORED" | jq -r --arg b "$bucket" '
+    [ .[] | select(.bucket == $b) ] |
+    if length == 0 then empty
+    else .[] |
+      "- [\(.title)](https://github.com/'"$REPO"'/pull/\(.number)) — "
+      + "score \(.score) · "
+      + (if .draft then "draft · " else "" end)
+      + "CI \(.ci | ascii_downcase) · "
+      + "\(.merge_state | ascii_downcase) · "
+      + "\(.age_days)d old · "
+      + "\(.size) lines · "
+      + "review \(.review | ascii_downcase)"
+    end
+  ')
+  if [[ -n "$items" ]]; then
+    local count
+    count=$(echo "$SCORED" | jq --arg b "$bucket" '[ .[] | select(.bucket == $b) ] | length')
+    echo ""
+    echo "## ${emoji} ${heading} (${count})"
+    echo ""
+    echo "$items"
+  fi
+}
+
+echo "# PR Triage: ${REPO}"
+echo ""
+echo "_${COUNT} open PRs by ${AUTHOR} · $(date -u +%Y-%m-%d)_"
+
+print_section "easy_merge"      "Easy merges — green, clean, go"    "🟢"
+print_section "needs_attention"  "Needs attention — recent but broken" "🟡"
+print_section "decision_needed"  "Decision needed"                    "🔵"
+print_section "easy_close"       "Easy close candidates"              "🔴"
+print_section "monitor"          "Monitoring"                         "⚪"
+
+echo ""
+
+# ── optional LLM pass ───────────────────────────────────────────────────────
+
+if [[ "$LLM" == "true" ]]; then
+  AMBIGUOUS=$(echo "$SCORED" | jq '[ .[] | select(.bucket == "decision_needed" or .bucket == "easy_close") ]')
+  AMB_COUNT=$(echo "$AMBIGUOUS" | jq length)
+
+  if [[ "$AMB_COUNT" -eq 0 ]]; then
+    echo "_No ambiguous PRs — LLM pass skipped._"
+    exit 0
+  fi
+
+  CARDS=$(echo "$AMBIGUOUS" | jq '[.[] | {
+    number, title, age_days, inactive_days, draft, ci, merge_state, review,
+    size, base, bucket, labels
+  }]')
+
+  PROMPT="You are a pragmatic engineering lead triaging open pull requests.
+
+For each PR below, recommend exactly ONE action and a one-sentence reason:
+  merge — ready to land as-is
+  fix_ci — worth saving, just fix the CI / rebase
+  rebase — worth saving, needs conflict resolution
+  close — abandon, stale or superseded
+  keep — intentionally keep open (explain why)
+
+Be decisive. Ancient draft PRs with conflicts are almost always closes.
+PRs that are green+clean but old need a judgment call on relevance.
+
+Respond as a JSON array: [{\"number\": N, \"action\": \"...\", \"reason\": \"...\"}]
+
+PRs:
+${CARDS}"
+
+  echo "---"
+  echo ""
+  echo "## 🤖 LLM judgment (ambiguous PRs)"
+  echo ""
+
+  # Try omp/claude/gh-copilot in order; fall back to printing the prompt
+  if command -v claude &>/dev/null; then
+    LLM_OUT=$(echo "$PROMPT" | claude --print 2>/dev/null) || true
+  elif command -v omp &>/dev/null; then
+    LLM_OUT=$(omp -p "$PROMPT" --no-tools 2>/dev/null) || true
+  fi
+
+  if [[ -n "${LLM_OUT:-}" ]]; then
+    # Try to extract JSON and render as table
+    JSON_BLOCK=$(echo "$LLM_OUT" | jq -r '.[] | "| #\(.number) | **\(.action)** | \(.reason) |"' 2>/dev/null) || true
+    if [[ -n "${JSON_BLOCK:-}" ]]; then
+      echo "| PR | Action | Reason |"
+      echo "|---|---|---|"
+      echo "$JSON_BLOCK"
+    else
+      echo "$LLM_OUT"
+    fi
+  else
+    echo "_Could not reach an LLM. Feed this to your model of choice:_"
+    echo ""
+    echo '```'
+    echo "$PROMPT"
+    echo '```'
+  fi
+fi
